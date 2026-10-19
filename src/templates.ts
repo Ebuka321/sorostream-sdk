@@ -8,6 +8,38 @@ function days(n: number): number {
 }
 
 /**
+ * Token classes a template can branch on when resolving a conditional
+ * parameter (issue #710). Open string so callers may pass registry labels.
+ */
+export type TemplateTokenType = 'native' | 'stablecoin' | 'volatile' | (string & {});
+
+/** Context passed to conditional template parameters at instantiation (issue #710). */
+export interface TemplateTokenContext {
+  /** The token type the template is being instantiated with. */
+  tokenType: TemplateTokenType;
+  /** Decimals of that token (default 7, the Stellar asset standard). */
+  decimals: number;
+}
+
+/**
+ * A template parameter that is either a static value (existing behaviour) or
+ * a resolver evaluated at instantiation time with the token context, so
+ * different token types can produce different resolved parameters (issue #710).
+ */
+export type ConditionalParam<T> = T | ((ctx: TemplateTokenContext) => T);
+
+/**
+ * Resolves a {@link ConditionalParam}: static values pass through unchanged,
+ * functions are invoked with the instantiation context (issue #710).
+ */
+export function resolveConditionalParam<T>(
+  value: ConditionalParam<T>,
+  ctx: TemplateTokenContext,
+): T {
+  return typeof value === 'function' ? (value as (ctx: TemplateTokenContext) => T)(ctx) : value;
+}
+
+/**
  * Pre-built stream templates that produce ready-to-use CreateStreamParams,
  * reducing boilerplate for common stream configurations.
  *
@@ -62,5 +94,33 @@ export const templates = {
     params: Omit<CreateStreamParams, 'durationSeconds'> & { days: number },
   ): CreateStreamParams {
     return { ...params, durationSeconds: days(params.days) };
+  },
+
+  /**
+   * Creates a stream whose initial amount is a token-type-conditional
+   * parameter, resolved at instantiation time from the given token type and
+   * decimals (issue #710). Static `amount` values keep working unchanged.
+   *
+   * @example
+   * ```ts
+   * const params = templates.minAmountStream({
+   *   recipient: "G…", token: "GUSDC…", autoRenew: false,
+   *   tokenType: "stablecoin", decimals: 6,
+   *   amount: (ctx) => 10n ** BigInt(ctx.decimals), // 1 unit minimum
+   * });
+   * ```
+   */
+  minAmountStream(
+    params: Omit<CreateStreamParams, 'amount'> & {
+      amount: ConditionalParam<bigint>;
+      tokenType: TemplateTokenType;
+      decimals?: number;
+    },
+  ): CreateStreamParams {
+    const { tokenType, decimals = 7, amount, ...rest } = params;
+    return {
+      ...rest,
+      amount: resolveConditionalParam(amount, { tokenType, decimals }),
+    };
   },
 };
