@@ -35,19 +35,67 @@ export class LocalStorageStreamCache {
     return `${KEY_PREFIX}:${network}:${streamId}`;
   }
 
-  /** Returns the last persisted state for a stream, or `undefined` if absent, stale, or corrupt. */
-  get(network: string, streamId: string): Stream | undefined {
+  /** Reads the raw stored entry, ignoring the freshness window. `undefined` if absent or corrupt. */
+  private read(network: string, streamId: string): StoredStreamEntry | undefined {
     try {
       const raw = this.storage.getItem(this.key(network, streamId));
       if (!raw) return undefined;
       const entry = JSON.parse(raw) as StoredStreamEntry;
-      if (typeof entry.cachedAt !== 'number' || Date.now() - entry.cachedAt > this.maxAgeMs) {
-        return undefined;
-      }
+      if (typeof entry.cachedAt !== 'number') return undefined;
+      return entry;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** Returns the last persisted state for a stream, or `undefined` if absent, stale, or corrupt. */
+  get(network: string, streamId: string): Stream | undefined {
+    const entry = this.read(network, streamId);
+    if (!entry || Date.now() - entry.cachedAt > this.maxAgeMs) return undefined;
+    try {
       return deserializeStream(entry.stream);
     } catch {
       return undefined;
     }
+  }
+
+  /**
+   * Stale-while-revalidate read (issue #713).
+   *
+   * Returns the cached value immediately — even when it is older than the
+   * freshness window used by {@link get} — alongside a refresh promise. The
+   * refresh promise runs `refresh()`, writes the resulting stream back into
+   * the cache on success (leaving the cache untouched on failure), and
+   * resolves with the updated value. Callers that ignore `refresh` while it
+   * can reject should attach a no-op catch handler.
+   */
+  getWithRevalidate(
+    network: string,
+    streamId: string,
+    refresh: () => Promise<Stream>,
+  ): { value: Stream | undefined; refresh: Promise<Stream> } {
+    const entry = this.read(network, streamId);
+    let value: Stream | undefined;
+    if (entry) {
+      try {
+        value = deserializeStream(entry.stream);
+      } catch {
+        value = undefined;
+      }
+    }
+
+    let started: Promise<Stream>;
+    try {
+      started = refresh();
+    } catch (error) {
+      started = Promise.reject(error instanceof Error ? error : new Error(String(error)));
+    }
+    const revalidated = started.then((stream) => {
+      this.set(network, stream);
+      return stream;
+    });
+
+    return { value, refresh: revalidated };
   }
 
   /** Persists `stream` as the last-known state for its ID. Never throws. */

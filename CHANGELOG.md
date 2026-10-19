@@ -6,6 +6,9 @@ The format is based on Keep a Changelog and uses the contributor guidance in CON
 
 ## [Unreleased]
 
+### Added
+- Add stale-while-revalidate reads to the persistent stream cache via `LocalStorageStreamCache.getWithRevalidate()`, returning the cached value immediately alongside a refresh promise that updates the cache entry when it resolves (#713)
+
 ### Fixed
 - Fix `nativeToStream` referencing an undefined `stream` variable in dead code left over from a merge, which made every stream read throw `ReferenceError` (#611)
 - Fix `createStream` validating the token contract (an RPC round-trip) before cheap offline checks like `durationSeconds`, so malformed input unnecessarily waited on a network call before failing (#542)
@@ -16,6 +19,9 @@ The format is based on Keep a Changelog and uses the contributor guidance in CON
 - Fix the `no-magic-flow-rate` ESLint rule checking for a `flowRate` property name on `updateFlowRate()` calls when the SDK's actual parameter is named `newFlowRate`, and missing negative numeric literals (`-500`), which parse as a `UnaryExpression` rather than a `Literal` (#633)
 - Fix the `require-claimable-before-withdraw` ESLint rule's auto-fixer not re-indenting the statement following its inserted `getClaimable` call (#634)
 - Fix `WriteRateLimiter`'s burst-allowance change bypassing queue-capacity backpressure entirely for any call using a bucket that hasn't been used yet, defeating the `queueSize` cap (#542)
+- Fix `RequestDeduplicator` letting a caller arriving in a later turn join an in-flight entry that had already settled but not yet been cleaned up, by deferring the join decision one microtask so settle cleanup always runs first (#714)
+- Fix `ConnectionPool` waiter grants depending on queue insertion order, selecting the highest-priority longest-waiting caller explicitly (priority rank, then enqueue sequence) so same-tick releases always honour `PRIORITY_RANK` (#715)
+- Fix `ReplayTransport.replay()` matching fixtures by method name only, now matching recorded request parameters first and falling back to per-method insertion order only for entries recorded without parameters (#720)
 
 ## [1.0.0] - 2026-09-28
 
