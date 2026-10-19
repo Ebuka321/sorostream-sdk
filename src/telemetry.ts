@@ -34,6 +34,16 @@ function getOtel(): any | null {
  */
 export type TelemetryEventFilter = readonly string[] | ((eventType: string) => boolean);
 
+/** Options controlling telemetry behaviour beyond event collection (issue #702). */
+export interface TelemetryOptions {
+  /**
+   * Endpoint that receives a best-effort fire-and-forget payload when the
+   * page unloads with a partially-filled batch. `navigator.sendBeacon` is
+   * used when available, with a `keepalive` `fetch` as fallback.
+   */
+  beaconUrl?: string;
+}
+
 interface PendingSpan {
   span: Span;
   attributes?: Attributes;
@@ -44,6 +54,10 @@ export class Telemetry {
   private tracer: Tracer | null = null;
   readonly enabled: boolean;
   private readonly eventFilter?: TelemetryEventFilter;
+  private readonly beaconUrl?: string;
+  private visibilityHandler: (() => void) | null = null;
+  private unloadHandler: (() => void) | null = null;
+  private disposed = false;
 
   /** Spans queued to be ended as part of the next batch (issue #623). */
   private pending: PendingSpan[] = [];
@@ -54,14 +68,22 @@ export class Telemetry {
   /** Milliseconds to wait before auto-flushing a non-full batch. */
   private readonly flushIntervalMs = 5_000;
 
-  constructor(enabled: boolean, eventFilter?: TelemetryEventFilter) {
+  constructor(
+    enabled: boolean,
+    eventFilter?: TelemetryEventFilter,
+    options: TelemetryOptions = {},
+  ) {
     this.enabled = enabled;
     this.eventFilter = eventFilter;
+    this.beaconUrl = options.beaconUrl;
     if (enabled) {
       const otel = getOtel();
       if (otel) {
         this.tracer = otel.trace.getTracer('@sorostream/sdk', VERSION);
       }
+      // Issue #702: the batch timer can outlive the page; flush on unload so
+      // the last partially-filled batch is not dropped.
+      this.registerUnloadHandlers();
     }
   }
 
@@ -109,6 +131,86 @@ export class Telemetry {
     for (const { span, attributes, endTime } of batch) {
       if (attributes) span.setAttributes(attributes);
       span.end(endTime);
+    }
+  }
+
+  /**
+   * Registers best-effort unload listeners so a partially-filled batch is
+   * flushed when the page is hidden or closed instead of being dropped when
+   * the flush timer never fires (issue #702).
+   *
+   * Listeners are attached only when telemetry is enabled and the host
+   * environment exposes a DOM.
+   */
+  private registerUnloadHandlers(): void {
+    if (typeof document !== 'undefined' && typeof document.addEventListener === 'function') {
+      this.visibilityHandler = () => {
+        if (document.visibilityState === 'hidden') this.flushOnUnload();
+      };
+      document.addEventListener('visibilitychange', this.visibilityHandler);
+    }
+    if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
+      this.unloadHandler = () => this.flushOnUnload();
+      window.addEventListener('beforeunload', this.unloadHandler);
+    }
+  }
+
+  /**
+   * Ends the queued batch immediately and, when a beacon endpoint is
+   * configured, ships a fire-and-forget copy of it with `navigator.sendBeacon`
+   * (or a `keepalive` `fetch` when the beacon API is unavailable), since
+   * unload-time requests must not depend on the event loop surviving
+   * (issue #702).
+   */
+  flushOnUnload(): void {
+    if (this.pending.length === 0) return;
+    const payload = JSON.stringify({
+      sdk: '@sorostream/sdk',
+      version: VERSION,
+      spanCount: this.pending.length,
+      spans: this.pending.map(({ attributes, endTime }) => ({
+        attributes: attributes ?? {},
+        endTime,
+      })),
+    });
+    this.flush();
+
+    if (!this.beaconUrl) return;
+    if (typeof navigator !== 'undefined' && typeof navigator.sendBeacon === 'function') {
+      try {
+        navigator.sendBeacon(this.beaconUrl, payload);
+      } catch {
+        // best-effort: the page is going away
+      }
+      return;
+    }
+    if (typeof fetch === 'function') {
+      void fetch(this.beaconUrl, {
+        method: 'POST',
+        body: payload,
+        keepalive: true,
+        headers: { 'content-type': 'application/json' },
+      }).catch(() => {
+        // best-effort: the page is going away
+      });
+    }
+  }
+
+  /** Detaches the unload listeners and cancels the pending flush timer. */
+  dispose(): void {
+    if (this.disposed) return;
+    this.disposed = true;
+    if (this.visibilityHandler && typeof document !== 'undefined') {
+      document.removeEventListener('visibilitychange', this.visibilityHandler);
+    }
+    if (this.unloadHandler && typeof window !== 'undefined') {
+      window.removeEventListener('beforeunload', this.unloadHandler);
+    }
+    this.visibilityHandler = null;
+    this.unloadHandler = null;
+    if (this.flushTimer) {
+      clearTimeout(this.flushTimer);
+      this.flushTimer = null;
     }
   }
 

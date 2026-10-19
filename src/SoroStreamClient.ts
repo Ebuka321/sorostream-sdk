@@ -57,6 +57,7 @@ import { LocalStorageStreamCache } from './streamStateCache.js';
 import { SoroStreamObservable, shareLatest } from './observable.js';
 import { NoopLogger } from './logger.js';
 import type { Logger } from './logger.js';
+import { assertMemoTextWithinLimit } from './memo.js';
 
 export type { SoroStreamConfigUpdate, ConfigUpdatedEvent } from './types.js';
 import { StreamMonitor } from './stream-monitor.js';
@@ -518,6 +519,12 @@ export interface SoroStreamClientOptions {
    * as an allow-list or a predicate. Default: all events are collected.
    */
   telemetryEvents?: import('./telemetry.js').TelemetryEventFilter;
+  /**
+   * Endpoint that receives a best-effort `navigator.sendBeacon` payload when
+   * the page unloads with a partially-filled telemetry batch, so the final
+   * batch is not dropped (issue #702).
+   */
+  telemetryBeaconUrl?: string;
   /**
    * Set to `false` to disable in-flight request deduplication (issue #426).
    *
@@ -1143,6 +1150,8 @@ export class SoroStreamClient<TEventData = Record<string, unknown>> {
     clientFinalizers?.unregister(this);
     // Flush batched telemetry and release cached stream objects (issues #623, #624).
     this.telemetry?.flush();
+    // Detach the page-unload flush listeners owned by this client (issue #702).
+    this.telemetry?.dispose();
     this.streamCache.clear();
     this.eventPoller = null;
     this.pool = null;
@@ -2120,16 +2129,13 @@ export class SoroStreamClient<TEventData = Record<string, unknown>> {
    * Builds a Stellar {@link Memo} from a write-option memo value (issue #201).
    *
    * - `string` values are encoded as `MEMO_TEXT`. Stellar limits text memos to
-   *   28 bytes once UTF-8 encoded; longer values throw.
+   *   28 bytes once UTF-8 encoded; longer values throw (issue #704).
    * - {@link MemoHash} values are encoded as `MEMO_HASH` and must be exactly
    *   32 bytes; any other length throws.
    */
   private buildMemo(memo: string | MemoHash): Memo {
     if (typeof memo === 'string') {
-      const byteLength = new TextEncoder().encode(memo).byteLength;
-      if (byteLength > 28) {
-        throw new Error(`Text memo exceeds the 28-byte limit (got ${byteLength} bytes)`);
-      }
+      assertMemoTextWithinLimit(memo);
       return Memo.text(memo);
     }
     if (memo.length !== 32) {

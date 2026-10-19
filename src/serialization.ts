@@ -5,7 +5,7 @@
  * to work with the structured clone algorithm and Web Workers.
  */
 
-import { Account, Contract, Memo, Networks, TransactionBuilder, xdr } from '@stellar/stellar-sdk';
+import { Account, Contract, Networks, TransactionBuilder, xdr } from '@stellar/stellar-sdk';
 import type {
   BuildUnsignedXdrParams,
   Network,
@@ -14,6 +14,7 @@ import type {
   PositiveFlowRate,
 } from './types.js';
 import { createContractEncoder } from './contractEncoders.js';
+import { encodeMemo } from './memo.js';
 import { assertStellarAddress } from './utils.js';
 
 const NETWORK_PASSPHRASES: Record<Network, string> = {
@@ -233,7 +234,10 @@ export function buildUnsignedXdr(
   });
 
   if (params.memo) {
-    builder = builder.addMemo(Memo.text(params.memo));
+    // Issue #704: validate the 28-byte text limit before the transaction is
+    // built, so an oversized memo fails with SoroStreamMemoError instead of
+    // an opaque XDR encoding failure.
+    builder = builder.addMemo(encodeMemo(params.memo));
   }
 
   builder = builder.addOperation(op);

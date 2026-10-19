@@ -10,6 +10,7 @@ import { jitterDelay } from './internal.js';
 export { redactSecretKey, jitterDelay } from './internal.js';
 import { getDefaultWebSocketFactory } from './adapters.js';
 import type { FetchAdapter, WebSocketFactory } from './adapters.js';
+import { assertMemoTextWithinLimit } from './memo.js';
 import { Memo, TransactionBuilder, Transaction, Networks } from '@stellar/stellar-sdk';
 import type { FeeBumpTransaction } from '@stellar/stellar-sdk';
 import type {
@@ -1952,6 +1953,87 @@ export function deserializeStreamFromJSON(json: string): import('./types.js').St
   return stream;
 }
 
+/**
+ * Streaming counterpart to {@link deserializeStreamFromJSON} for large
+ * stream-history payloads (issue #708).
+ *
+ * Walks a top-level JSON array without parsing the whole payload into memory,
+ * yielding each record as soon as it is complete. Callers that only need the
+ * first N records can `break` out of the loop early. Each yielded record is
+ * identical to what the non-streaming helpers produce for the same payload.
+ *
+ * @param payload - JSON array string of serialized streams (as produced by
+ *   `JSON.stringify(records, bigintReplacer)`).
+ * @yields One {@link Stream} per array element.
+ * @throws {Error} If the payload is not a well-formed top-level JSON array.
+ *
+ * @example
+ * ```ts
+ * for (const stream of deserializeStreamRecords(payload)) {
+ *   process(stream);
+ * }
+ * ```
+ */
+export function* deserializeStreamRecords(
+  payload: string,
+): Generator<import('./types.js').Stream, void, void> {
+  let i = 0;
+  const n = payload.length;
+  const skipWs = (): void => {
+    while (i < n && /\s/.test(payload.charAt(i))) i++;
+  };
+
+  skipWs();
+  if (payload.charAt(i) !== '[') {
+    throw new Error('deserializeStreamRecords: expected a top-level JSON array payload');
+  }
+  i++;
+  skipWs();
+  if (payload.charAt(i) === ']') return;
+
+  while (i < n) {
+    const start = i;
+    let depth = 0;
+    let inString = false;
+    let escaped = false;
+    while (i < n) {
+      const c = payload.charAt(i);
+      i++;
+      if (inString) {
+        if (escaped) escaped = false;
+        else if (c === '\\') escaped = true;
+        else if (c === '"') inString = false;
+        continue;
+      }
+      if (c === '"') {
+        inString = true;
+        continue;
+      }
+      if (c === '{' || c === '[') {
+        depth++;
+        continue;
+      }
+      if (c === '}' || c === ']') {
+        depth--;
+        if (depth === 0) break;
+      }
+    }
+    if (depth !== 0) {
+      throw new Error('deserializeStreamRecords: unterminated record in payload');
+    }
+    yield deserializeStreamFromJSON(payload.slice(start, i));
+    skipWs();
+    if (payload.charAt(i) === ',') {
+      i++;
+      skipWs();
+      continue;
+    }
+    if (payload.charAt(i) === ']') return;
+    throw new Error('deserializeStreamRecords: malformed JSON array payload');
+  }
+  throw new Error('deserializeStreamRecords: payload array was never closed');
+}
+
 // ── Stream ID encoding / decoding (base58, URL-safe) ──────────────────────
 
 const BASE58_ALPHABET = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
@@ -2046,8 +2128,13 @@ export function parseStreamId(streamId: string): bigint {
  * is passed directly to `Memo.hash()` which accepts hex natively, keeping
  * this function free of Node.js Buffer APIs and safe in Cloudflare Workers.
  *
+ * Issue #704: text values are validated against the 28-byte limit before
+ * `Memo.text()` is called, so an oversized memo fails here with a typed
+ * error instead of later during XDR encoding or submission.
+ *
  * @param value - The raw memo value.
  * @returns A Stellar Memo object, or Memo-none if null/undefined.
+ * @throws {SoroStreamMemoError} If a text value exceeds 28 UTF-8 bytes.
  */
 export function parseMemo(value: string | null | undefined): import('@stellar/stellar-sdk').Memo {
   if (value == null || value === '') return Memo.none();
@@ -2056,6 +2143,7 @@ export function parseMemo(value: string | null | undefined): import('@stellar/st
     // no Buffer required, works in all environments including CF Workers.
     return Memo.hash(value);
   }
+  assertMemoTextWithinLimit(value);
   return Memo.text(value);
 }
 
@@ -2515,21 +2603,35 @@ export function parseMetadataUri(uri: string): Record<string, string> {
 /**
  * Wraps an inner transaction (or its base64 XDR) in a Stellar fee-bump
  * envelope signed by `feeSource`.
+ *
+ * The inner transaction's time bounds are checked before wrapping (issue
+ * #705): if `maxTime` has already lapsed a bump would be rejected by the
+ * network, so this throws {@link FeeBumpExpiredError} with a clear
+ * explanation instead of failing opaquely at submission. Pass `opts.renew`
+ * (with a `resign` callback) to renew the bounds via the documented bump
+ * path and wrap the re-signed transaction instead of failing.
  */
 export function withFeeBump(
   inner: Transaction | string,
   feeSource: string,
-  opts?: { networkPassphrase?: string; baseFee?: number },
+  opts?: {
+    networkPassphrase?: string;
+    baseFee?: number;
+    /** Unix seconds to evaluate the inner transaction's time bounds against (issue #705). */
+    now?: number;
+    /** Renewal path for lapsed bounds: renewed via `renewTimeBounds`, then re-signed by `resign`. */
+    renew?: FeeBumpRenewalOptions;
+  },
 ): FeeBumpTransaction {
   const passphrase = opts?.networkPassphrase ?? Networks.TESTNET;
   const tx =
     typeof inner === 'string'
       ? (TransactionBuilder.fromXDR(inner, passphrase) as Transaction)
       : inner;
-  return TransactionBuilder.buildFeeBumpTransaction(
-    feeSource,
-    String(opts?.baseFee ?? 100),
-    tx,
-    passphrase,
-  ) as FeeBumpTransaction;
+  return wrapForFeeBump(tx, feeSource, {
+    networkPassphrase: passphrase,
+    baseFee: opts?.baseFee,
+    now: opts?.now,
+    renew: opts?.renew,
+  });
 }

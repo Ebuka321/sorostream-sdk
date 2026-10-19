@@ -101,6 +101,7 @@ export {
   buildMetadataUri,
   parseMetadataUri,
   withFeeBump,
+  deserializeStreamRecords,
 } from './utils.js';
 export type {
   StreamMetadataFields,
@@ -110,6 +111,8 @@ export type {
   RateUnit,
 } from './utils.js';
 export { templates } from './templates.js';
+export { resolveConditionalParam } from './templates.js';
+export type { ConditionalParam, TemplateTokenContext, TemplateTokenType } from './templates.js';
 export { serializeStream, deserializeStream, buildUnsignedXdr } from './serialization.js';
 export type { SerializedStream } from './serialization.js';
 export { ScValCache, cachedScVal, cachedBool, cachedScValBase64 } from './scValCache.js';
@@ -199,6 +202,8 @@ export {
   FeeTooHighError,
   MalformedWalletResponseError,
   MetadataTooLargeError,
+  BatchOperationLimitExceededError,
+  FeeBumpExpiredError,
 } from './errors.js';
 export type { XdrValidationErrorCode } from './errors.js';
 export { assertEnvelopeUnmutated } from './xdrValidation.js';
@@ -344,7 +349,14 @@ export {
   RecipientValidationError,
   InvalidTokenContractError,
 } from './errors.js';
-export { SanitizingLogger, NoopLogger, ConsoleLogger, createLogger } from './logger.js';
+export {
+  SanitizingLogger,
+  NoopLogger,
+  ConsoleLogger,
+  NamespacedLogger,
+  createLogger,
+  withModule,
+} from './logger.js';
 export type { Logger, LogLevel, CreateLoggerOptions } from './logger.js';
 export { StreamStateMachine, InvalidStateTransitionError } from './state-machine.js';
 export type { StreamState, StreamAction } from './state-machine.js';
@@ -367,7 +379,8 @@ export type {
 } from './types.js';
 export { PluginRegistry } from './pluginRegistry.js';
 export { getPortfolioStats } from './portfolioAnalytics.js';
-export { scheduleFeeBumpMonitor } from './feeBump.js';
+export { scheduleFeeBumpMonitor, renewTimeBounds, wrapForFeeBump } from './feeBump.js';
+export type { FeeBumpWrapOptions, FeeBumpRenewalOptions } from './feeBump.js';
 export { createFeeRetryMiddleware, FeeRetryError } from './feeRetryMiddleware.js';
 export type { FeeRetryMiddlewareOptions } from './feeRetryMiddleware.js';
 export { createFederationPlugin } from './federationPlugin.js';

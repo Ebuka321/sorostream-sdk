@@ -590,3 +590,49 @@ export class InvalidTokenContractError extends SoroStreamError {
     this.token = token;
   }
 }
+
+/**
+ * Thrown when `BatchBuilder.submit()` is called with more queued operations
+ * than the Soroban per-transaction operation limit (issue #700). Thrown ahead
+ * of submission so oversized batches fail locally instead of with an opaque
+ * network error.
+ */
+export class BatchOperationLimitExceededError extends SoroStreamError {
+  /** Number of operations that were queued in the batch. */
+  readonly operationCount: number;
+  /** The maximum operations allowed in a single transaction. */
+  readonly maxOperations: number;
+
+  constructor(operationCount: number, maxOperations: number) {
+    super(
+      `Batch contains ${operationCount} operations, exceeding the Soroban ` +
+        `per-transaction limit of ${maxOperations}. Split the batch and ` +
+        `submit the remaining operations separately (issue #700).`,
+    );
+    this.name = 'BatchOperationLimitExceededError';
+    this.operationCount = operationCount;
+    this.maxOperations = maxOperations;
+  }
+}
+
+/**
+ * Thrown when a transaction is wrapped for fee bumping but the inner
+ * transaction's time bounds have already lapsed (issue #705). A bump of an
+ * expired transaction is always rejected by the network, so the wrapper
+ * surfaces this clear error instead of letting the submission fail opaquely.
+ * Renew bounds via `renewTimeBounds()` and re-sign before wrapping.
+ */
+export class FeeBumpExpiredError extends SoroStreamError {
+  /** The inner transaction's `maxTime` (unix seconds) that has passed. */
+  readonly expiredAt: number;
+
+  constructor(expiredAt: number) {
+    super(
+      `Inner transaction expired at ${new Date(expiredAt * 1000).toISOString()} ` +
+        `(time bounds maxTime=${expiredAt}); it can no longer be fee-bumped. ` +
+        `Rebuild and re-sign it with renewed bounds (renewTimeBounds) before wrapping (issue #705).`,
+    );
+    this.name = 'FeeBumpExpiredError';
+    this.expiredAt = expiredAt;
+  }
+}
