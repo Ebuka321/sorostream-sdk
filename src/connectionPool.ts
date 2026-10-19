@@ -40,6 +40,14 @@ interface PoolSlot {
   lastActive: number;
 }
 
+/** A queued {@link ConnectionPool.acquire} caller awaiting a free connection. */
+interface Waiter {
+  grant: () => void;
+  rank: number;
+  /** Monotonic enqueue sequence; breaks FIFO ties between equal ranks (issue #715). */
+  seq: number;
+}
+
 /**
  * Manages a fixed set of reusable RPC connections and event pollers.
  * New subscriptions are routed to the least-loaded slot.
@@ -57,7 +65,9 @@ export class ConnectionPool {
   /** Number of connections currently held via {@link acquire}. */
   private activeConnections = 0;
   /** FIFO queue of pending {@link acquire} grants waiting for a free connection. */
-  private waiters: Array<{ grant: () => void; rank: number }> = [];
+  private waiters: Waiter[] = [];
+  /** Monotonic sequence assigned to each enqueued waiter (issue #715). */
+  private waiterSeq = 0;
 
   constructor(options: ConnectionPoolOptions) {
     this.rpcUrl = options.rpcUrl;
@@ -200,7 +210,7 @@ export class ConnectionPool {
           slot.subscriptions = Math.max(0, slot.subscriptions - 1);
           this.activeConnections = Math.max(0, this.activeConnections - 1);
           // Hand the freed slot to the highest-priority, longest-waiting caller.
-          const next = this.waiters.shift();
+          const next = this._nextWaiter();
           if (next) next.grant();
           if (this.slots.every((s) => s.subscriptions === 0)) {
             this._emit({ type: 'pool:drain' });
@@ -223,11 +233,10 @@ export class ConnectionPool {
       if (this.activeConnections < this.maxConnections) {
         grant();
       } else {
-        // Insert after all waiters of equal or higher priority (FIFO within a priority).
-        const idx = this.waiters.findIndex((w) => w.rank > rank);
-        const entry = { grant, rank };
-        if (idx === -1) this.waiters.push(entry);
-        else this.waiters.splice(idx, 0, entry);
+        // Grant order is decided solely by `_nextWaiter()` (priority rank,
+        // then enqueue sequence), never by insertion or same-tick arrival
+        // order within the queue — issue #715.
+        this.waiters.push({ grant, rank, seq: this.waiterSeq++ });
       }
     });
   }
@@ -263,6 +272,30 @@ export class ConnectionPool {
       if (slot.subscriptions < best.subscriptions) best = slot;
     }
     return best;
+  }
+
+  /**
+   * Removes and returns the next waiter to grant: lowest {@link PRIORITY_RANK}
+   * first, FIFO among equal ranks by enqueue sequence (issue #715). Selecting
+   * explicitly from the queue keeps grants deterministic — priority first,
+   * then enqueue order — regardless of how waiters were inserted or in what
+   * order they arrived within the same event-loop tick.
+   */
+  private _nextWaiter(): Waiter | undefined {
+    let bestIdx = -1;
+    for (let i = 0; i < this.waiters.length; i++) {
+      const candidate = this.waiters[i]!;
+      const best = bestIdx === -1 ? undefined : this.waiters[bestIdx];
+      if (
+        !best ||
+        candidate.rank < best.rank ||
+        (candidate.rank === best.rank && candidate.seq < best.seq)
+      ) {
+        bestIdx = i;
+      }
+    }
+    if (bestIdx === -1) return undefined;
+    return this.waiters.splice(bestIdx, 1)[0];
   }
 
   /**

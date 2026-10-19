@@ -15,6 +15,12 @@
  *   Failures are therefore never cached and the next caller retries.
  * - Every joined caller observes the *same* resolved value (or rejection),
  *   which keeps concurrent readers consistent with each other.
+ * - Callers arriving in a later turn than the entry's creation take their
+ *   join decision one microtask later, so entry removal on settle always
+ *   completes first and a late joiner can never receive the result of an
+ *   already-settled request (issue #714). Same-turn callers still join
+ *   synchronously, preserving the original deduplication contract
+ *   (issue #426), including for synchronously-resolving factories.
  */
 
 /** Counters describing deduplication effectiveness. */
@@ -58,6 +64,14 @@ export interface DedupeCallOptions {
   fresh?: boolean;
 }
 
+/** Bookkeeping for a tracked in-flight request (issue #714). */
+interface InFlightEntry {
+  /** Shared promise handed to joiners. */
+  promise: Promise<unknown>;
+  /** `true` only within the synchronous turn the entry was created in. */
+  creationTick: boolean;
+}
+
 /**
  * Coalesces concurrent async requests that share the same key.
  *
@@ -72,7 +86,7 @@ export interface DedupeCallOptions {
  * ```
  */
 export class RequestDeduplicator {
-  private readonly inFlight = new Map<string, Promise<unknown>>();
+  private readonly inFlight = new Map<string, InFlightEntry>();
   private readonly startedAt = new Map<string, number>();
   private readonly maxAgeMs: number;
   private readonly enabled: boolean;
@@ -107,29 +121,53 @@ export class RequestDeduplicator {
       return this.invoke(factory);
     }
 
-    const existing = this.inFlight.get(key) as Promise<T> | undefined;
+    const existing = this.inFlight.get(key);
     const maxAge = options.maxAgeMs ?? this.maxAgeMs;
     const age = Date.now() - (this.startedAt.get(key) ?? Date.now());
     if (existing && !options.fresh && age <= maxAge) {
-      this.deduplicated++;
-      this.onDeduplicated?.(key);
-      return existing;
+      if (existing.creationTick) {
+        return this.join(key, existing) as Promise<T>;
+      }
+      // Settle cleanup runs as a microtask after this caller's turn, so
+      // defer the join decision by one microtask: any pending removal
+      // completes first and a late joiner can never observe an entry that
+      // has already settled (issue #714). If the entry survived, join it;
+      // otherwise start fresh work.
+      return Promise.resolve().then(() => {
+        const current = this.inFlight.get(key);
+        if (current) {
+          const currentAge = Date.now() - (this.startedAt.get(key) ?? Date.now());
+          if (currentAge <= maxAge) return this.join(key, current) as Promise<T>;
+        }
+        return this.start(key, factory);
+      });
     }
 
+    return this.start(key, factory);
+  }
+
+  /** Registers `factory`'s shared promise under `key` and wires settle cleanup. */
+  private start<T>(key: string, factory: () => Promise<T>): Promise<T> {
     this.started++;
     const shared = this.invoke(factory);
-    this.inFlight.set(key, shared);
+    const entry: InFlightEntry = { promise: shared, creationTick: true };
+    this.inFlight.set(key, entry);
     this.startedAt.set(key, Date.now());
+    // Leave the creation turn, so only same-turn callers join synchronously.
+    Promise.resolve().then(() => {
+      entry.creationTick = false;
+    });
     if (this.inFlight.size > this.peakInFlight) {
       this.peakInFlight = this.inFlight.size;
     }
 
     // Release the slot on settle. `finally` ensures cleanup runs whether the
     // promise fulfills or rejects, preventing leaks from timeouts or other
-    // rejection scenarios.
+    // rejection scenarios. The identity guard keeps a `fresh` replacement's
+    // entry from being clobbered by an older request's cleanup.
     shared
       .finally(() => {
-        if (this.inFlight.get(key) === shared) {
+        if (this.inFlight.get(key) === entry) {
           this.inFlight.delete(key);
           this.startedAt.delete(key);
         }
@@ -137,6 +175,13 @@ export class RequestDeduplicator {
       .catch(() => {});
 
     return shared;
+  }
+
+  /** Hands `entry`'s shared promise to a joiner and records the stat. */
+  private join(key: string, entry: InFlightEntry): Promise<unknown> {
+    this.deduplicated++;
+    this.onDeduplicated?.(key);
+    return entry.promise;
   }
 
   /** Returns `true` when a request for `key` is currently in flight. */

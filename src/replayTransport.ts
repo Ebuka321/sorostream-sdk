@@ -10,9 +10,11 @@
  *
  * **Replay mode** (`ReplayTransport.replay(fixture)`)
  *   No live network calls are made. Requests are matched against the stored
- *   fixture entries in insertion order (per method). Throws
- *   `ReplayFixtureError` when a request arrives for which there is no
- *   remaining fixture entry.
+ *   fixture entries by method **and** recorded request parameters: the first
+ *   remaining entry recorded with parameters equal to the incoming request
+ *   wins; entries recorded without parameters fall back to insertion order
+ *   per method (issue #720). Throws `ReplayFixtureError` when a request
+ *   arrives for which there is no remaining matching fixture entry.
  *
  * Both modes return an object that satisfies `RpcTransportAdapter`, so they
  * can be passed directly to `SoroStreamClient` via the `transport` option.
@@ -105,10 +107,50 @@ function deserialise<T>(value: unknown): T {
 }
 
 /**
- * Simple per-method FIFO queue used to serve replay entries in order.
+ * `true` when a recorded request carries no parameter information — `null`,
+ * `undefined`, an absent field, or an empty object (issue #720). Such entries
+ * are treated as parameter-unaware and served by insertion order.
+ */
+function hasNoParams(request: unknown): boolean {
+  return (
+    request === undefined ||
+    request === null ||
+    (typeof request === 'object' &&
+      !Array.isArray(request) &&
+      Object.keys(request as object).length === 0)
+  );
+}
+
+/**
+ * Canonical match key for a request's parameters (issue #720). The value is
+ * normalised through `serialise` first so BigInts compare structurally, then
+ * stringified with sorted object keys so property order never splits a match.
+ */
+function paramsKey(request: unknown): string {
+  return stableStringify(serialise(request));
+}
+
+function stableStringify(value: unknown): string {
+  if (value === null || typeof value !== 'object') {
+    return JSON.stringify(value) ?? 'null';
+  }
+  if (Array.isArray(value)) {
+    return `[${value.map(stableStringify).join(',')}]`;
+  }
+  const entries = Object.entries(value as Record<string, unknown>)
+    .filter(([, v]) => v !== undefined)
+    .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+    .map(([k, v]) => `${JSON.stringify(k)}:${stableStringify(v)}`);
+  return `{${entries.join(',')}}`;
+}
+
+/**
+ * Per-method replay queue that serves stored fixture entries by method **and**
+ * recorded request parameters (issue #720), falling back to insertion order
+ * for entries recorded without parameters.
  */
 class ReplayQueue {
-  private readonly queues = new Map<string, unknown[]>();
+  private readonly queues = new Map<string, FixtureEntry[]>();
   private consumed = 0;
 
   load(entries: FixtureEntry[]): void {
@@ -116,17 +158,37 @@ class ReplayQueue {
       if (!this.queues.has(entry.method)) {
         this.queues.set(entry.method, []);
       }
-      this.queues.get(entry.method)!.push(entry.response);
+      this.queues.get(entry.method)!.push(entry);
     }
   }
 
-  next<T>(method: string): T {
+  next<T>(method: string, request: unknown): T {
     const queue = this.queues.get(method);
     if (!queue || queue.length === 0) {
       throw new ReplayFixtureError(method, this.consumed);
     }
+
+    // 1) Parameter-exact match: first remaining entry recorded with
+    //    parameters equal to the incoming request (order-independent).
+    const incoming = hasNoParams(request) ? undefined : paramsKey(request);
+    let idx = -1;
+    if (incoming !== undefined) {
+      idx = queue.findIndex(
+        (entry) => !hasNoParams(entry.request) && paramsKey(entry.request) === incoming,
+      );
+    }
+    // 2) Fallback: first remaining entry recorded without parameters, in
+    //    per-method insertion order.
+    if (idx === -1) {
+      idx = queue.findIndex((entry) => hasNoParams(entry.request));
+    }
+    if (idx === -1) {
+      throw new ReplayFixtureError(method, this.consumed);
+    }
+
+    const entry = queue.splice(idx, 1)[0]!;
     this.consumed++;
-    return deserialise<T>(queue.shift());
+    return deserialise<T>(entry.response);
   }
 }
 
@@ -314,9 +376,9 @@ export const ReplayTransport = {
     // resolve in recording order (issue #544).
     let serialised: Promise<void> = Promise.resolve();
 
-    function serve<T>(method: string): Promise<T> {
+    function serve<T>(method: string, request: unknown): Promise<T> {
       if (sequential) {
-        const next: Promise<T> = serialised.then(() => queue.next<T>(method));
+        const next: Promise<T> = serialised.then(() => queue.next<T>(method, request));
         // Keep the chain alive even if the caller rejects its response.
         serialised = next.then(
           () => undefined,
@@ -324,7 +386,7 @@ export const ReplayTransport = {
         );
         return next;
       }
-      return Promise.resolve().then(() => queue.next<T>(method));
+      return Promise.resolve().then(() => queue.next<T>(method, request));
     }
 
     const transport: ReplayingRpcTransport = {
@@ -332,25 +394,26 @@ export const ReplayTransport = {
 
       getFixture: () => parsed,
 
-      getAccount: (_address: string) => serve<Account>('getAccount'),
+      getAccount: (address: string) => serve<Account>('getAccount', { address }),
 
-      getHealth: () => serve<rpc.Api.GetHealthResponse>('getHealth'),
+      getHealth: () => serve<rpc.Api.GetHealthResponse>('getHealth', {}),
 
-      getLatestLedger: () => serve<rpc.Api.GetLatestLedgerResponse>('getLatestLedger'),
+      getLatestLedger: () => serve<rpc.Api.GetLatestLedgerResponse>('getLatestLedger', {}),
 
-      getTransaction: (_hash: string) => serve<rpc.Api.GetTransactionResponse>('getTransaction'),
+      getTransaction: (hash: string) =>
+        serve<rpc.Api.GetTransactionResponse>('getTransaction', { hash }),
 
-      simulateTransaction: (_tx: Transaction | FeeBumpTransaction) =>
-        serve<rpc.Api.SimulateTransactionResponse>('simulateTransaction'),
+      simulateTransaction: (tx: Transaction | FeeBumpTransaction) =>
+        serve<rpc.Api.SimulateTransactionResponse>('simulateTransaction', { xdr: tx.toXDR() }),
 
-      prepareTransaction: (_tx: Transaction | FeeBumpTransaction) =>
-        serve<Transaction | FeeBumpTransaction>('prepareTransaction'),
+      prepareTransaction: (tx: Transaction | FeeBumpTransaction) =>
+        serve<Transaction | FeeBumpTransaction>('prepareTransaction', { xdr: tx.toXDR() }),
 
-      sendTransaction: (_tx: Transaction | FeeBumpTransaction) =>
-        serve<rpc.Api.SendTransactionResponse>('sendTransaction'),
+      sendTransaction: (tx: Transaction | FeeBumpTransaction) =>
+        serve<rpc.Api.SendTransactionResponse>('sendTransaction', { xdr: tx.toXDR() }),
 
-      getEvents: (_req: RpcTransportGetEventsRequest) =>
-        serve<rpc.Api.GetEventsResponse>('getEvents'),
+      getEvents: (req: RpcTransportGetEventsRequest) =>
+        serve<rpc.Api.GetEventsResponse>('getEvents', req),
     };
 
     return transport;
