@@ -10,6 +10,7 @@ import { jitterDelay } from './internal.js';
 export { redactSecretKey, jitterDelay } from './internal.js';
 import { getDefaultWebSocketFactory } from './adapters.js';
 import type { FetchAdapter, WebSocketFactory } from './adapters.js';
+import { assertMemoTextWithinLimit } from './memo.js';
 import { Memo, TransactionBuilder, Transaction, Networks } from '@stellar/stellar-sdk';
 import type { FeeBumpTransaction } from '@stellar/stellar-sdk';
 import type {
@@ -2046,8 +2047,13 @@ export function parseStreamId(streamId: string): bigint {
  * is passed directly to `Memo.hash()` which accepts hex natively, keeping
  * this function free of Node.js Buffer APIs and safe in Cloudflare Workers.
  *
+ * Issue #704: text values are validated against the 28-byte limit before
+ * `Memo.text()` is called, so an oversized memo fails here with a typed
+ * error instead of later during XDR encoding or submission.
+ *
  * @param value - The raw memo value.
  * @returns A Stellar Memo object, or Memo-none if null/undefined.
+ * @throws {SoroStreamMemoError} If a text value exceeds 28 UTF-8 bytes.
  */
 export function parseMemo(value: string | null | undefined): import('@stellar/stellar-sdk').Memo {
   if (value == null || value === '') return Memo.none();
@@ -2056,6 +2062,7 @@ export function parseMemo(value: string | null | undefined): import('@stellar/st
     // no Buffer required, works in all environments including CF Workers.
     return Memo.hash(value);
   }
+  assertMemoTextWithinLimit(value);
   return Memo.text(value);
 }
 

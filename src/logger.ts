@@ -30,6 +30,29 @@ export interface Logger {
   info(message: string, ...args: unknown[]): void;
   warn(message: string, ...args: unknown[]): void;
   error(message: string, ...args: unknown[]): void;
+  /**
+   * Returns a namespaced logger for a module (e.g. `'connectionPool'`,
+   * `'retry'`) whose level overrides take precedence over the global level
+   * (issue #703). Optional so third-party `Logger` implementations stay
+   * source-compatible; use `withModule()` for a null-safe way to obtain one.
+   */
+  child?(moduleName: string): Logger;
+}
+
+/**
+ * Returns a namespaced child logger for `moduleName`.
+ *
+ * Falls back to `logger` itself when the logger does not implement `child`,
+ * so this is safe to call with any `Logger` implementation.
+ *
+ * @example
+ * ```ts
+ * const logger = createLogger({ minLevel: 'warn', moduleLevels: { retry: 'debug' } });
+ * withModule(logger, 'retry').debug('backoff attempt 2');
+ * ```
+ */
+export function withModule(logger: Logger, moduleName: string): Logger {
+  return logger.child?.(moduleName) ?? logger;
 }
 
 /**
@@ -41,6 +64,10 @@ export class NoopLogger implements Logger {
   info(_message: string, ..._args: unknown[]): void {}
   warn(_message: string, ..._args: unknown[]): void {}
   error(_message: string, ..._args: unknown[]): void {}
+  /** Every namespace discards messages too, so the logger itself is returned. */
+  child(_moduleName: string): Logger {
+    return this;
+  }
 }
 
 /**
@@ -82,6 +109,11 @@ export class ConsoleLogger implements Logger {
       console.error(`[sorostream] ${message}`, ...args);
     }
   }
+
+  /** `ConsoleLogger` has no per-module overrides, so namespaces share its level. */
+  child(_moduleName: string): Logger {
+    return this;
+  }
 }
 
 /**
@@ -121,6 +153,73 @@ export class SanitizingLogger implements Logger {
     const cleanArgs = args.map((a) => (typeof a === 'string' ? redactSecretKey(a) : a));
     this.delegate.error(cleanMsg, ...cleanArgs);
   }
+
+  /** Keeps secret redaction for every namespace while delegating the level. */
+  child(moduleName: string): Logger {
+    return new SanitizingLogger(this.delegate.child?.(moduleName) ?? this.delegate);
+  }
+}
+
+/**
+ * A logger decorator that resolves an effective level per module namespace.
+ *
+ * `moduleLevels[moduleName]` wins over the global `defaultLevel`, so one
+ * subsystem can be raised (or silenced) without changing the rest (issue #703).
+ *
+ * Returned by `createLogger({ moduleLevels })`; obtain namespaced instances
+ * with `logger.child('moduleName')` or `withModule(logger, 'moduleName')`.
+ *
+ * @example
+ * ```ts
+ * const logger = createLogger({
+ *   minLevel: 'error',
+ *   moduleLevels: { connectionPool: 'debug' },
+ * });
+ * logger.child?.('connectionPool').debug('reusing idle socket'); // logged
+ * logger.debug('global debug');                                  // dropped
+ * ```
+ */
+export class NamespacedLogger implements Logger {
+  constructor(
+    private readonly delegate: Logger,
+    private readonly defaultLevel: LogLevel,
+    private readonly moduleLevels: Readonly<Record<string, LogLevel>> = {},
+    private readonly moduleName?: string,
+  ) {}
+
+  /** Level for this namespace: its override if configured, else the global level. */
+  get effectiveLevel(): LogLevel {
+    if (this.moduleName !== undefined) {
+      const override = this.moduleLevels[this.moduleName];
+      if (override !== undefined) return override;
+    }
+    return this.defaultLevel;
+  }
+
+  private enabled(level: LogLevel): boolean {
+    return LEVEL_PRIORITY[level] >= LEVEL_PRIORITY[this.effectiveLevel];
+  }
+
+  debug(message: string, ...args: unknown[]): void {
+    if (this.enabled('debug')) this.delegate.debug(message, ...args);
+  }
+
+  info(message: string, ...args: unknown[]): void {
+    if (this.enabled('info')) this.delegate.info(message, ...args);
+  }
+
+  warn(message: string, ...args: unknown[]): void {
+    if (this.enabled('warn')) this.delegate.warn(message, ...args);
+  }
+
+  error(message: string, ...args: unknown[]): void {
+    if (this.enabled('error')) this.delegate.error(message, ...args);
+  }
+
+  /** Shares the same override map and delegate with a different namespace. */
+  child(moduleName: string): Logger {
+    return new NamespacedLogger(this.delegate, this.defaultLevel, this.moduleLevels, moduleName);
+  }
 }
 
 export interface CreateLoggerOptions {
@@ -140,6 +239,17 @@ export interface CreateLoggerOptions {
    * the external logger directly).
    */
   delegate?: Logger;
+  /**
+   * Per-module (namespace) level overrides, e.g.
+   * `{ connectionPool: 'debug', retry: 'silent' }` (issue #703).
+   *
+   * Each override takes precedence over `minLevel` for loggers obtained via
+   * `logger.child(moduleName)` / `withModule(logger, moduleName)`; namespaces
+   * without an override keep the global level. Providing overrides makes the
+   * returned logger filter levels itself, so a `delegate` should then emit
+   * everything it is handed.
+   */
+  moduleLevels?: Record<string, LogLevel>;
 }
 
 /**
@@ -159,15 +269,36 @@ export interface CreateLoggerOptions {
  *
  * // Bring-your-own pino/winston logger
  * const pinoLogger = createLogger({ delegate: pino() });
+ *
+ * // Per-module overrides: quiet globally, verbose for one subsystem
+ * const scoped = createLogger({
+ *   minLevel: 'warn',
+ *   moduleLevels: { connectionPool: 'debug' },
+ * });
+ * scoped.child?.('connectionPool').debug('reusing idle socket'); // logged
+ * scoped.debug('global debug');                                  // dropped
  * ```
  */
 export function createLogger(options: CreateLoggerOptions = {}): Logger {
-  const { minLevel = 'info', sanitize = true, delegate } = options;
+  const { minLevel = 'info', sanitize = true, delegate, moduleLevels } = options;
+  const hasModuleLevels = moduleLevels !== undefined && Object.keys(moduleLevels).length > 0;
 
-  if (minLevel === 'silent' && !delegate) {
-    return new NoopLogger();
+  if (!hasModuleLevels) {
+    if (minLevel === 'silent' && !delegate) {
+      return new NoopLogger();
+    }
+    const base: Logger = delegate ?? new ConsoleLogger(minLevel);
+    return sanitize ? new SanitizingLogger(base) : base;
   }
 
-  const base: Logger = delegate ?? new ConsoleLogger(minLevel);
-  return sanitize ? new SanitizingLogger(base) : base;
+  // With module overrides the wrapper owns level filtering, so the delegate
+  // must be able to emit every level the wrapper lets through — build the
+  // console logger at the most verbose configured level.
+  const mostVerbose = Object.values(moduleLevels!).reduce<LogLevel>(
+    (acc, level) => (LEVEL_PRIORITY[level] < LEVEL_PRIORITY[acc] ? level : acc),
+    minLevel,
+  );
+  const base: Logger = delegate ?? new ConsoleLogger(mostVerbose);
+  const sanitized = sanitize ? new SanitizingLogger(base) : base;
+  return new NamespacedLogger(sanitized, minLevel, moduleLevels!);
 }

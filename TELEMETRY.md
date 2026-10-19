@@ -66,6 +66,30 @@ const client = new SoroStreamClient({
 
 ---
 
+## Unload flush
+
+Finished spans are batched in memory, so a page that is hidden or closed
+before the batch timer fires would otherwise lose that batch. When telemetry
+is enabled the SDK registers `visibilitychange` (on `hidden`) and
+`beforeunload` listeners that end the pending batch immediately (issue #702).
+
+Optionally, `telemetryBeaconUrl` ships a fire-and-forget copy of that final
+batch to **an endpoint you configure**, using `navigator.sendBeacon` when the
+browser provides it and a `keepalive` `fetch` otherwise. No request is made
+when the option is omitted:
+
+```ts
+const client = new SoroStreamClient({
+  // ...
+  telemetryBeaconUrl: 'https://telemetry.example.com/batches',
+});
+```
+
+The beacon payload is limited to span attributes, timestamps, counts, and the
+SDK version — the same no-PII data described above.
+
+---
+
 ## Verifying telemetry is disabled
 
 The `telemetry` option is stored on the client instance and can be read back:
