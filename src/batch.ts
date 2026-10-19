@@ -14,7 +14,7 @@
  * ```
  */
 
-export { BatchBuilder } from './batchBuilder.js';
+export { BatchBuilder, SOROBAN_MAX_OPS_PER_TX } from './batchBuilder.js';
 
 export { parseCsvStreamRows, batchSize } from './utils.js';
 export { ConnectionPool } from './connectionPool.js';

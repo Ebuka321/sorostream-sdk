@@ -55,6 +55,7 @@ export {
   jsonStringify,
   serializeStreamToJSON,
   deserializeStreamFromJSON,
+  deserializeStreamRecords,
   bigintReplacer,
   bigintReviver,
   validateStringLength,
@@ -63,6 +64,8 @@ export {
   decodeStreamId,
 } from './utils.js';
 export { templates } from './templates.js';
+export { resolveConditionalParam } from './templates.js';
+export type { ConditionalParam, TemplateTokenContext, TemplateTokenType } from './templates.js';
 export { CircuitBreaker } from './circuitBreaker.js';
 export { withRetry } from './retry.js';
 export type { RetryOptions } from './retry.js';
