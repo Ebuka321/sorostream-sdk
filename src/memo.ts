@@ -3,7 +3,7 @@ import type { MemoType } from '@stellar/stellar-sdk';
 import { SoroStreamMemoError } from './errors.js';
 
 /** Maximum byte length of a Soroban/Stellar text memo. */
-const TEXT_MEMO_MAX_BYTES = 28;
+export const MEMO_TEXT_MAX_BYTES = 28;
 
 /** Fixed byte length of a Soroban/Stellar hash memo. */
 const HASH_MEMO_BYTES = 32;
@@ -20,6 +20,25 @@ function uint8ArrayToHex(data: Uint8Array): string {
 }
 
 /**
+ * Asserts that `text` fits in a Stellar `MEMO_TEXT` (28 UTF-8 bytes),
+ * throwing before any XDR encoding or submission happens (issue #704).
+ *
+ * Use this from any code path that builds a text memo so callers get the
+ * same clear, typed error regardless of which helper produced the memo.
+ *
+ * @param text - The memo text to validate.
+ * @throws {SoroStreamMemoError} If `text` exceeds 28 bytes (UTF-8 encoded).
+ */
+export function assertMemoTextWithinLimit(text: string): void {
+  const byteLength = new TextEncoder().encode(text).byteLength;
+  if (byteLength > MEMO_TEXT_MAX_BYTES) {
+    throw new SoroStreamMemoError(
+      `Text memo exceeds ${MEMO_TEXT_MAX_BYTES} bytes (got ${byteLength} bytes)`,
+    );
+  }
+}
+
+/**
  * Encodes a string as a Stellar transaction text memo, validating that it
  * does not exceed the protocol's 28-byte limit.
  *
@@ -32,12 +51,7 @@ function uint8ArrayToHex(data: Uint8Array): string {
  * ```
  */
 export function encodeMemo(text: string): Memo<MemoType.Text> {
-  const byteLength = new TextEncoder().encode(text).byteLength;
-  if (byteLength > TEXT_MEMO_MAX_BYTES) {
-    throw new SoroStreamMemoError(
-      `Text memo exceeds ${TEXT_MEMO_MAX_BYTES} bytes (got ${byteLength} bytes)`,
-    );
-  }
+  assertMemoTextWithinLimit(text);
   return Memo.text(text);
 }
 
