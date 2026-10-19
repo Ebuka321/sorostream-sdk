@@ -349,7 +349,14 @@ export {
   RecipientValidationError,
   InvalidTokenContractError,
 } from './errors.js';
-export { SanitizingLogger, NoopLogger, ConsoleLogger, createLogger } from './logger.js';
+export {
+  SanitizingLogger,
+  NoopLogger,
+  ConsoleLogger,
+  NamespacedLogger,
+  createLogger,
+  withModule,
+} from './logger.js';
 export type { Logger, LogLevel, CreateLoggerOptions } from './logger.js';
 export { StreamStateMachine, InvalidStateTransitionError } from './state-machine.js';
 export type { StreamState, StreamAction } from './state-machine.js';
